@@ -5,9 +5,58 @@
 #include <cuda_runtime.h>
 #endif
 #include <stdint.h>
+#include <memory>
+
+#include "rxmesh/util/macros.h"
+#include "rxmesh/util/timer.h"
 
 namespace rxmesh {
 
+static __global__ void warmup_kernel(float* buffer)
+{
+    const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+    float     x   = 1.0f + float(tid) * 1e-6f;
+
+    for (int i = 0; i < 8192; ++i) {
+        x = fmaf(x, 1.000001f, 0.000001f);
+    }
+    atomicExch(buffer, x);
+}
+
+inline void warmup_gpu(float ms, cudaStream_t stream = NULL)
+{
+    if (ms <= 0.0f) {
+        return;
+    }
+
+    int device;
+    CUDA_ERROR(cudaGetDevice(&device));
+
+    cudaDeviceProp prop{};
+    CUDA_ERROR(cudaGetDeviceProperties(&prop, device));
+
+    constexpr int threads = 256;
+    const int     blocks  = 32 * prop.multiProcessorCount;
+
+    // allocate one float variable which all threads will write to
+    // this variable will be released at normal program exit so that we leave
+    // the device idle after warmup when cudaFree is called
+    static const std::unique_ptr<float, decltype(&cudaFree)> buffer(
+        [] {
+            float* ptr = nullptr;
+            CUDA_ERROR(cudaMalloc(&ptr, sizeof(float)));
+            return ptr;
+        }(),
+        &cudaFree);
+
+    GPUTimer timer(stream);
+    timer.start();
+    do {
+        warmup_kernel<<<blocks, threads, 0, stream>>>(buffer.get());
+        CUDA_ERROR(cudaGetLastError());
+        timer.stop();
+    } while (timer.elapsed_millis() < ms);
+}
 template <typename attrT>
 __global__ void memcopy(attrT*         d_dest,
                         const attrT*   d_src,

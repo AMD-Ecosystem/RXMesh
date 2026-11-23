@@ -3,6 +3,7 @@ include_guard(GLOBAL)
 
 include("${CMAKE_CURRENT_LIST_DIR}/rapidjson.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/rapidobj.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/mshio.cmake")
 # OpenMesh is only used by the apps (as a CPU reference); skip it otherwise.
 if(RX_BUILD_APPS)
     include("${CMAKE_CURRENT_LIST_DIR}/openmesh.cmake")

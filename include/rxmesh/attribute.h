@@ -2,6 +2,7 @@
 
 #include <assert.h>
 #include <cuda_runtime_api.h>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
@@ -37,21 +38,23 @@ class AttributeBase
 
     virtual void release(locationT location = LOCATION_ALL) = 0;
 
+    virtual void release_name() = 0;
+
     virtual ~AttributeBase() = default;
 };
 
 /**
  * @brief  Here we manage the attributes on top of the mesh. An attributes is
- * attached to mesh element (e.g., vertices, edges, or faces).
- * largely inspired by
+ * attached to mesh element (e.g., vertices, edges, faces, or tets). largely
+ * inspired by
  * https://github.com/gunrock/gunrock/blob/master/gunrock/util/array_utils.cuh
  * It is discouraged to use Attribute directly in favor of using
- * add_X_attributes() from RXMeshStatic where X is vertex, edge, or face. This
- * way, the user does not have to specify the number of mesh elements or
+ * add_X_attributes() from RXMeshStatic where X is vertex, edge, face, or tet.
+ * This way, the user does not have to specify the number of mesh elements or
  * deallocate/release the Attribute (attribute garbage collection is managed by
  * RXMeshStatic)
  * @tparam T type of the attribute
- * @tparam HandleT One of VertexHandle, EdgeHandle, or FaceHandle
+ * @tparam HandleT One of VertexHandle, EdgeHandle, FaceHandle, or TetHandle
  */
 template <class T, typename HandleT>
 class Attribute : public AttributeBase
@@ -83,12 +86,9 @@ class Attribute : public AttributeBase
           m_layout(AoS),
           m_total_bytes(0),
           m_h_linear_id_element_prefix(nullptr),
-          m_d_linear_id_element_prefix(nullptr)
+          m_d_linear_id_element_prefix(nullptr),
+          m_external_device_buffer(false)
     {
-#if defined(__CUDACC__) || defined(__HIPCC__)
-        this->m_name    = (char*)malloc(sizeof(char) * 1);
-        this->m_name[0] = '\0';
-#endif
     }
 
     /**
@@ -149,7 +149,14 @@ class Attribute : public AttributeBase
      * corresponds to the template HandleT
      * @param p the patch id
      */
-    __host__ __device__ __inline__ uint32_t size(const uint32_t p) const;
+    __host__ __device__ __forceinline__ uint32_t size(const uint32_t p) const
+    {
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+        return m_d_patches_info[p].get_num_elements<HandleT>()[0];
+#else
+        return m_h_patches_info[p].get_num_elements<HandleT>()[0];
+#endif
+    }
 
     /**
      * @brief get maximum number of elements in a patch. The element type
@@ -169,8 +176,15 @@ class Attribute : public AttributeBase
     /**
      * @brief Get patch info for patch p
      */
-    __host__ __device__ __inline__ const PatchInfo& get_patch_info(
-        const uint32_t p) const;
+    __host__ __device__ __forceinline__ const PatchInfo& get_patch_info(
+        const uint32_t p) const
+    {
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+        return m_d_patches_info[p];
+#else
+        return m_h_patches_info[p];
+#endif
+    }
 
 
     __host__ __device__ __forceinline__ uint32_t pitch_x() const
@@ -196,6 +210,11 @@ class Attribute : public AttributeBase
     virtual ~Attribute() = default;
 
     /**
+     * @brief Release the name allocation.     
+     */
+    void release_name() override;
+
+    /**
      * @brief Get the name of the attribute
      */
     const char* get_name() const;
@@ -203,27 +222,42 @@ class Attribute : public AttributeBase
     /**
      * @brief get the number of attributes per mesh element
      */
-    __host__ __device__ __inline__ uint32_t get_num_attributes() const;
+    __host__ __device__ __forceinline__ uint32_t get_num_attributes() const
+    {
+        return m_num_attributes;
+    }
 
     /**
      * @brief Flag that indicates where the memory is allocated
      */
-    __host__ __device__ __inline__ locationT get_allocated() const;
+    __host__ __device__ __forceinline__ locationT get_allocated() const
+    {
+        return m_allocated;
+    }
 
     /**
      * @brief return the memory layout
      */
-    __host__ __device__ __inline__ layoutT get_layout() const;
+    __host__ __device__ __forceinline__ layoutT get_layout() const
+    {
+        return m_layout;
+    }
 
     /**
      * @brief Check if attribute is allocated on device
      */
-    __host__ __device__ __inline__ bool is_device_allocated() const;
+    __host__ __device__ __forceinline__ bool is_device_allocated() const
+    {
+        return ((m_allocated & DEVICE) == DEVICE);
+    }
 
     /**
      * @brief Check if attribute is allocated on host
      */
-    __host__ __device__ __inline__ bool is_host_allocated() const;
+    __host__ __device__ __forceinline__ bool is_host_allocated() const
+    {
+        return ((m_allocated & HOST) == HOST);
+    }
 
     /**
      * @brief Return the raw storage pointer for a host or device
@@ -258,6 +292,117 @@ class Attribute : public AttributeBase
     __host__ __device__ bool is_tensor_layout() const
     {
         return m_layout == SoA;
+    }
+
+    /**
+     * @brief True when the device storage points at memory owned by an
+     * external party (e.g., a PyTorch tensor). In that case this attribute
+     * never allocates or frees the device pointer.
+     */
+    __host__ __device__ bool is_external_device_buffer() const
+    {
+        return m_external_device_buffer;
+    }
+
+    /**
+     * @brief Point the device storage at memory owned by somebody else.
+     *
+     * This is meant mainly for interop with external array frameworks that
+     * already hold a buffer matching this attribute's true SoA (global
+     * column-major) layout. The caller keeps ownership and must guarantee that
+     * ptr stays valid for as long as this attribute reads or writes through
+     * it. Only supported for SoA (tensor) layout, since that is the only layout
+     * with a well defined global memory layout (that is independent of the
+     * RXMesh patches)      
+     * @param ptr device pointer holding size()
+     * get_num_attributes() values
+     * @param capacity_bytes accessible bytes
+     * beginning at ptr
+     * @return true on success and false on validation
+     * failure
+     */
+    bool attach_device_buffer(T* ptr, size_t capacity_bytes)
+    {
+        if (m_layout != SoA) {
+            RXMESH_ERROR(
+                "Attribute::attach_device_buffer() is only supported for "
+                "true SoA (tensor) layout attributes.");
+            return false;
+        }
+
+        const size_t required_bytes =
+            sizeof(T) * size_t(m_num_elements) * size_t(m_num_attributes);
+
+        if (required_bytes != 0 && ptr == nullptr) {
+            RXMESH_ERROR(
+                "Attribute::attach_device_buffer() received a null pointer "
+                "for a non-empty attribute.");
+            return false;
+        }
+
+        if (capacity_bytes < required_bytes) {
+            RXMESH_ERROR(
+                "Attribute::attach_device_buffer() received {} bytes but the "
+                "attribute requires at least {} bytes.",
+                capacity_bytes,
+                required_bytes);
+            return false;
+        }
+
+        if (ptr != nullptr &&
+            reinterpret_cast<std::uintptr_t>(ptr) % alignof(T) != 0) {
+            RXMESH_ERROR(
+                "Attribute::attach_device_buffer() received a pointer that is "
+                "not aligned for the attribute value type.");
+            return false;
+        }
+
+        if (ptr != nullptr) {
+            cudaPointerAttributes external_attributes{};
+
+            CUDA_ERROR(cudaPointerGetAttributes(&external_attributes, ptr));
+
+#if CUDART_VERSION >= 10000
+            if (external_attributes.type != cudaMemoryTypeDevice) {
+#else
+            if (external_attributes.memoryType != cudaMemoryTypeDevice) {
+#endif
+                RXMESH_ERROR(
+                    "Attribute::attach_device_buffer() requires device "
+                    "memory.");
+                return false;
+            }
+        }
+
+        // drop whatever we currently own on the device
+        release(DEVICE);
+
+        // SoA does not use the offset buffer, but this also refreshes
+        // m_total_bytes so storage_size()/get_total_bytes() stay correct.
+        allocate_offset();
+
+        if (ptr == nullptr) {
+            return true;
+        }
+
+        m_d_data                 = ptr;
+        m_external_device_buffer = true;
+        m_allocated              = m_allocated | DEVICE;
+        return true;
+    }
+
+    /**
+     * @brief Stop referencing an external device buffer without freeing it.
+     */
+    void detach_device_buffer()
+    {
+        if (!m_external_device_buffer) {
+            return;
+        }
+
+        m_d_data                 = nullptr;
+        m_external_device_buffer = false;
+        m_allocated              = m_allocated & (~DEVICE);
     }
 
     /**
@@ -370,7 +515,17 @@ class Attribute : public AttributeBase
      */
     template <int N>
     __host__ __device__ __inline__ Eigen::Matrix<T, N, 1> to_eigen(
-        const HandleT& handle) const;
+        const HandleT& handle) const
+    {
+        assert(N <= get_num_attributes());
+
+        Eigen::Matrix<T, N, 1> ret;
+
+        for (Eigen::Index i = 0; i < N; ++i) {
+            ret[i] = this->operator()(handle, i);
+        }
+        return ret;
+    }
 
     /**
      * @brief store an Eigen (small) vector in this attribute. The size of Eigen
@@ -380,7 +535,14 @@ class Attribute : public AttributeBase
     template <int N>
     __host__ __device__ __inline__ void from_eigen(
         const HandleT&                handle,
-        const Eigen::Matrix<T, N, 1>& in);
+        const Eigen::Matrix<T, N, 1>& in)
+    {
+        assert(N <= get_num_attributes());
+
+        for (Eigen::Index i = 0; i < N; ++i) {
+            this->operator()(handle, i) = in[i];
+        }
+    }
 
     /**
      * @brief Accessing an attribute using a handle to the mesh element
@@ -616,7 +778,10 @@ class Attribute : public AttributeBase
     /**
      * @brief Check if the attribute is empty
      */
-    __host__ __device__ __inline__ bool is_empty() const;
+    __host__ __device__ __forceinline__ bool is_empty() const
+    {
+        return m_max_num_patches == 0;
+    }
 
    protected:
     __host__ __device__ __forceinline__ uint32_t
@@ -656,6 +821,9 @@ class Attribute : public AttributeBase
     size_t           m_total_bytes;
     uint32_t*        m_h_linear_id_element_prefix;
     uint32_t*        m_d_linear_id_element_prefix;
+    // when true, m_d_data is owned by an external party and must never be
+    // allocated or freed by this attribute
+    bool m_external_device_buffer;
 
     constexpr static uint32_t m_block_size = 256;
 };
@@ -669,6 +837,9 @@ using EdgeAttribute = Attribute<T, EdgeHandle>;
 template <class T>
 using FaceAttribute = Attribute<T, FaceHandle>;
 
+template <class T>
+using TetAttribute = Attribute<T, TetHandle>;
+
 /**
  * @brief Attribute container used to manage a collection of attributes by
  * RXMeshStatic
@@ -676,12 +847,15 @@ using FaceAttribute = Attribute<T, FaceHandle>;
 class AttributeContainer
 {
    public:
-    AttributeContainer() = default;
+    AttributeContainer() : m_next_internal_attribute_id(0)
+    {
+    }
 
     virtual ~AttributeContainer()
     {
         while (!m_attr_container.empty()) {
             m_attr_container.back()->release();
+            m_attr_container.back()->release_name();
             m_attr_container.pop_back();
         }
     }
@@ -696,6 +870,11 @@ class AttributeContainer
      * @brief get a list of name of the attributes managed by this container
      */
     std::vector<std::string> get_attribute_names() const;
+
+    /**
+     * @brief Allocate monotonically increasing internal name.
+     */
+    std::string make_unique_name(const std::string& prefix);
 
     /**
      * @brief add a new attribute to be managed by this container
@@ -726,8 +905,12 @@ class AttributeContainer
      */
     void remove(const char* name);
 
+    /** @brief Remove exactly the supplied registered Attribute object. */
+    void remove(const AttributeBase* attribute);
+
    private:
     std::vector<std::shared_ptr<AttributeBase>> m_attr_container;
+    uint64_t                                    m_next_internal_attribute_id;
 };
 
 }  // namespace rxmesh

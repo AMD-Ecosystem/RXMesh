@@ -22,8 +22,7 @@ set(RXMESH_LIBRARY_SOURCES
     "${RXMESH_SOURCE_DIR}/include/rxmesh/reduce_handle.cu"
     "${RXMESH_SOURCE_DIR}/include/rxmesh/patcher/patcher.cu"
     "${RXMESH_SOURCE_DIR}/include/rxmesh/util/git_sha1.cpp"
-    "${RXMESH_SOURCE_DIR}/include/rxmesh/util/MshLoader.cpp"
-    "${RXMESH_SOURCE_DIR}/include/rxmesh/util/MshSaver.cpp"
+    "${RXMESH_SOURCE_DIR}/include/rxmesh/util/msh_io.cpp"
 )
 
 file(GLOB_RECURSE RXMESH_LIBRARY_HEADERS CONFIGURE_DEPENDS
@@ -71,6 +70,7 @@ if(USE_HIP)
 else()
     # Required for targets that compile CUDA sources.
     set_property(TARGET RXMesh PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+    rxmesh_enable_cuda_device_lto(RXMesh)
 endif()
 set_property(TARGET RXMesh PROPERTY POSITION_INDEPENDENT_CODE ON)
 
@@ -112,6 +112,7 @@ if(NOT USE_HIP)
     target_link_libraries(RXMesh PUBLIC cuBQL cuBQL_queries)
 endif()
 target_link_libraries(RXMesh PUBLIC rapidobj::rapidobj)
+target_link_libraries(RXMesh PRIVATE mshio::mshio)
 
 # CUDA and C++ compiler flags
 set(cxx_flags
@@ -129,9 +130,7 @@ set(cuda_flags
     # 20054-D "dynamic initialization is not supported for a function-scope static __shared__ variable within a __device__/__global__ function"
     -Xcudafe "--display_error_number --diag_suppress=177 --diag_suppress=174 --diag_suppress=20054"
     -rdc=true
-    -lineinfo
     --expt-extended-lambda
-    -use_fast_math
     $<$<CXX_COMPILER_ID:GNU>:-O3>
     --expt-relaxed-constexpr
     -Xptxas -warn-spills

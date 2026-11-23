@@ -13,6 +13,8 @@ namespace rxmesh {
 template <typename T, int VariableDim, typename OptVarHandleT>
 struct DiffVectorProblem
 {
+    // Jacobian columns use element_id * VariableDim + local_variable, so the
+    // corresponding per-element values use the same interleaved ordering.
     using DenseMatT = DenseMatrix<T, Eigen::RowMajor>;
     using JacSpMatT = JacobianSparseMatrix<T>;
 
@@ -94,6 +96,22 @@ struct DiffVectorProblem
                       op == Op::F) {
             auto new_term =
                 std::make_shared<TemplatedVectorTerm<FaceHandle,
+                                                     OptVarHandleT,
+                                                     blockThreads,
+                                                     op,
+                                                     ScalarT,
+                                                     InputDim,
+                                                     VariableDim,
+                                                     LambdaT>>(rx, t, oreinted);
+            terms.push_back(
+                std::dynamic_pointer_cast<VectorTerm<T, OptVarHandleT>>(
+                    new_term));
+        }
+
+        if constexpr (op == Op::T || op == Op::TV || op == Op::TE ||
+                      op == Op::TF) {
+            auto new_term =
+                std::make_shared<TemplatedVectorTerm<TetHandle,
                                                      OptVarHandleT,
                                                      blockThreads,
                                                      op,

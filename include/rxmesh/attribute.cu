@@ -49,7 +49,8 @@ __host__ Attribute<T, HandleT>::Attribute(const char*    name,
       m_layout(layout),
       m_total_bytes(0),
       m_h_linear_id_element_prefix(rxmesh->get_element_prefix<HandleT>(HOST)),
-      m_d_linear_id_element_prefix(rxmesh->get_element_prefix<HandleT>(DEVICE))
+      m_d_linear_id_element_prefix(rxmesh->get_element_prefix<HandleT>(DEVICE)),
+      m_external_device_buffer(false)
 
 {
     if (m_layout == SoA && !m_rxmesh->supports_global_soa_attribute_layout()) {
@@ -68,6 +69,9 @@ __host__ Attribute<T, HandleT>::Attribute(const char*    name,
     }
     if constexpr (std::is_same_v<HandleT, FaceHandle>) {
         m_num_elements = rxmesh->get_num_faces();
+    }
+    if constexpr (std::is_same_v<HandleT, TetHandle>) {
+        m_num_elements = rxmesh->get_num_tets();
     }
 
     if (name != nullptr) {
@@ -100,6 +104,9 @@ T& Attribute<T, HandleT>::operator()(size_t i, size_t j)
     if constexpr (std::is_same_v<HandleT, FaceHandle>) {
         return this->operator()(m_rxmesh->map_to_local_face(i), j);
     }
+    if constexpr (std::is_same_v<HandleT, TetHandle>) {
+        return this->operator()(m_rxmesh->map_to_local_tet(i), j);
+    }
 }
 
 template <class T, typename HandleT>
@@ -119,6 +126,9 @@ T& Attribute<T, HandleT>::operator()(size_t i, size_t j) const
     }
     if constexpr (std::is_same_v<HandleT, FaceHandle>) {
         return this->operator()(m_rxmesh->map_to_local_face(i), j);
+    }
+    if constexpr (std::is_same_v<HandleT, TetHandle>) {
+        return this->operator()(m_rxmesh->map_to_local_tet(i), j);
     }
 }
 
@@ -151,6 +161,10 @@ uint32_t Attribute<T, HandleT>::size() const
 
     if constexpr (std::is_same_v<HandleT, FaceHandle>) {
         return m_rxmesh->get_num_faces();
+    }
+
+    if constexpr (std::is_same_v<HandleT, TetHandle>) {
+        return m_rxmesh->get_num_tets();
     }
 
     return m_num_elements;
@@ -194,6 +208,14 @@ std::shared_ptr<DenseMatrix<T, Order>> Attribute<T, HandleT>::to_matrix() const
         });
     }
 
+    if constexpr (std::is_same_v<HandleT, TetHandle>) {
+        m_rxmesh->for_each_tet(HOST, [&](const TetHandle th) {
+            for (uint32_t j = 0; j < cols(); ++j) {
+                (*mat)(th, j) = this->operator()(th, j);
+            }
+        });
+    }
+
     mat->move(HOST, DEVICE);
 
     return mat;
@@ -229,71 +251,14 @@ void Attribute<T, HandleT>::from_matrix(DenseMatrix<T, Order>* mat)
             }
         });
     }
-}
 
-
-template <class T, typename HandleT>
-__host__ __device__ __forceinline__ uint32_t
-Attribute<T, HandleT>::size(const uint32_t p) const
-{
-#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
-    return m_d_patches_info[p].get_num_elements<HandleT>()[0];
-#else
-    return m_h_patches_info[p].get_num_elements<HandleT>()[0];
-#endif
-}
-
-template <class T, typename HandleT>
-__host__ __device__ __forceinline__ const PatchInfo&
-Attribute<T, HandleT>::get_patch_info(const uint32_t p) const
-{
-#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
-    return m_d_patches_info[p];
-#else
-    return m_h_patches_info[p];
-#endif
-}
-
-template <class T, typename HandleT>
-__host__ __device__ __forceinline__ uint32_t
-Attribute<T, HandleT>::get_num_attributes() const
-{
-    return this->m_num_attributes;
-}
-
-template <class T, typename HandleT>
-__host__ __device__ __forceinline__ locationT
-Attribute<T, HandleT>::get_allocated() const
-{
-    return this->m_allocated;
-}
-
-template <class T, typename HandleT>
-__host__ __device__ __forceinline__ layoutT
-Attribute<T, HandleT>::get_layout() const
-{
-    return this->m_layout;
-}
-
-template <class T, typename HandleT>
-__host__ __device__ __forceinline__ bool
-Attribute<T, HandleT>::is_device_allocated() const
-{
-    return ((m_allocated & DEVICE) == DEVICE);
-}
-
-template <class T, typename HandleT>
-__host__ __device__ __forceinline__ bool
-Attribute<T, HandleT>::is_host_allocated() const
-{
-    return ((m_allocated & HOST) == HOST);
-}
-
-
-template <class T, typename HandleT>
-__host__ __device__ __forceinline__ bool Attribute<T, HandleT>::is_empty() const
-{
-    return m_max_num_patches == 0;
+    if constexpr (std::is_same_v<HandleT, TetHandle>) {
+        m_rxmesh->for_each_tet(HOST, [&](const TetHandle th) {
+            for (uint32_t j = 0; j < cols(); ++j) {
+                this->operator()(th, j) = (*mat)(th, j);
+            }
+        });
+    }
 }
 
 
@@ -301,6 +266,15 @@ template <class T, typename HandleT>
 const char* Attribute<T, HandleT>::get_name() const
 {
     return m_name;
+}
+
+template <class T, typename HandleT>
+void Attribute<T, HandleT>::release_name()
+{
+    if (m_name != nullptr) {
+        free(m_name);
+        m_name = nullptr;
+    }
 }
 
 template <class T, typename HandleT>
@@ -334,6 +308,13 @@ void Attribute<T, HandleT>::move(locationT    source,
             "are the same.",
             location_to_string(source),
             location_to_string(target));
+        return;
+    }
+
+    if (m_external_device_buffer && (target & DEVICE) == DEVICE) {
+        RXMESH_ERROR(
+            "Attribute::move() cannot overwrite an attached external device "
+            "buffer. Detach it first.");
         return;
     }
 
@@ -382,10 +363,16 @@ void Attribute<T, HandleT>::release(locationT location)
         m_allocated = m_allocated & (~HOST);
     }
 
-    if (((location & DEVICE) == DEVICE) && is_device_allocated()) {
-        GPU_FREE(m_d_data);
+    if ((location & DEVICE) == DEVICE) {
+        if (m_external_device_buffer) {
+            // Borrowed storage is detached, never freed by RXMesh.
+            m_d_data = nullptr;
+        } else if (is_device_allocated()) {
+            GPU_FREE(m_d_data);
+        }
         GPU_FREE(m_d_offsets);
-        m_allocated = m_allocated & (~DEVICE);
+        m_external_device_buffer = false;
+        m_allocated              = m_allocated & (~DEVICE);
     }
 }
 
@@ -500,37 +487,15 @@ void Attribute<T, HandleT>::copy_from(Attribute<T, HandleT>& source,
 }
 
 template <class T, typename HandleT>
-template <int N>
-__host__ __device__ __inline__ Eigen::Matrix<T, N, 1>
-         Attribute<T, HandleT>::to_eigen(const HandleT& handle) const
-{
-    assert(N <= get_num_attributes());
-
-    Eigen::Matrix<T, N, 1> ret;
-
-    for (Eigen::Index i = 0; i < N; ++i) {
-        ret[i] = this->operator()(handle, i);
-    }
-    return ret;
-}
-
-template <class T, typename HandleT>
-template <int N>
-__host__ __device__ __inline__ void Attribute<T, HandleT>::from_eigen(
-    const HandleT&                handle,
-    const Eigen::Matrix<T, N, 1>& in)
-{
-    assert(N <= get_num_attributes());
-
-    for (Eigen::Index i = 0; i < N; ++i) {
-        this->operator()(handle, i) = in[i];
-    }
-}
-
-
-template <class T, typename HandleT>
 void Attribute<T, HandleT>::allocate(locationT location)
 {
+    if (((location & DEVICE) == DEVICE) && m_external_device_buffer) {
+        RXMESH_ERROR(
+            "Attribute::allocate() cannot replace an attached external "
+            "device buffer. Detach it first.");
+        return;
+    }
+
     if (m_max_num_patches != 0) {
         if ((location & HOST) == HOST) {
             release(HOST);
@@ -603,6 +568,15 @@ std::vector<std::string> AttributeContainer::get_attribute_names() const
     return names;
 }
 
+std::string AttributeContainer::make_unique_name(const std::string& prefix)
+{
+    std::string candidate;
+    do {
+        candidate = prefix + std::to_string(m_next_internal_attribute_id++);
+    } while (does_exist(candidate.c_str()));
+    return candidate;
+}
+
 template <typename AttrT>
 std::shared_ptr<AttrT> AttributeContainer::add(const char*   name,
                                                uint32_t      num_attributes,
@@ -641,9 +615,21 @@ void AttributeContainer::remove(const char* name)
          ++it) {
 
         if (!strcmp((*it)->get_name(), name)) {
+            remove(it->get());
+            return;
+        }
+    }
+}
+
+void AttributeContainer::remove(const AttributeBase* attribute)
+{
+    for (auto it = m_attr_container.begin(); it != m_attr_container.end();
+         ++it) {
+        if (it->get() == attribute) {
             (*it)->release(LOCATION_ALL);
+            (*it)->release_name();
             m_attr_container.erase(it);
-            break;
+            return;
         }
     }
 }
@@ -656,7 +642,8 @@ void AttributeContainer::remove(const char* name)
 #define RXMESH_ATTRIBUTE_INST_ALL_HANDLES(T) \
     RXMESH_ATTRIBUTE_INST(T, VertexHandle)   \
     RXMESH_ATTRIBUTE_INST(T, EdgeHandle)     \
-    RXMESH_ATTRIBUTE_INST(T, FaceHandle)
+    RXMESH_ATTRIBUTE_INST(T, FaceHandle)     \
+    RXMESH_ATTRIBUTE_INST(T, TetHandle)
 
 #define RXMESH_ATTR_CONTAINER_ADD_INST(AttrT)                       \
     template std::shared_ptr<AttrT> AttributeContainer::add<AttrT>( \
@@ -665,7 +652,8 @@ void AttributeContainer::remove(const char* name)
 #define RXMESH_ATTR_CONTAINER_ADD_INST_ALL_HANDLES(T)  \
     RXMESH_ATTR_CONTAINER_ADD_INST(VertexAttribute<T>) \
     RXMESH_ATTR_CONTAINER_ADD_INST(EdgeAttribute<T>)   \
-    RXMESH_ATTR_CONTAINER_ADD_INST(FaceAttribute<T>)
+    RXMESH_ATTR_CONTAINER_ADD_INST(FaceAttribute<T>)   \
+    RXMESH_ATTR_CONTAINER_ADD_INST(TetAttribute<T>)
 
 #define RXMESH_ATTRIBUTE_AND_CONTAINER_INST_ALL_HANDLES(T) \
     RXMESH_ATTRIBUTE_INST_ALL_HANDLES(T)                   \
@@ -692,6 +680,7 @@ RXMESH_ATTRIBUTE_AND_CONTAINER_INST_ALL_HANDLES(int64_t)
 RXMESH_ATTRIBUTE_AND_CONTAINER_INST_ALL_HANDLES(VertexHandle)
 RXMESH_ATTRIBUTE_AND_CONTAINER_INST_ALL_HANDLES(EdgeHandle)
 RXMESH_ATTRIBUTE_AND_CONTAINER_INST_ALL_HANDLES(FaceHandle)
+RXMESH_ATTRIBUTE_AND_CONTAINER_INST_ALL_HANDLES(TetHandle)
 
 #undef RXMESH_ATTRIBUTE_AND_CONTAINER_INST_ALL_HANDLES
 #undef RXMESH_ATTR_CONTAINER_ADD_INST_ALL_HANDLES
@@ -712,7 +701,8 @@ RXMESH_ATTRIBUTE_AND_CONTAINER_INST_ALL_HANDLES(FaceHandle)
 #define RXMESH_ATTR_TM_INST_ALL(T)       \
     RXMESH_ATTR_TM_INST(T, VertexHandle) \
     RXMESH_ATTR_TM_INST(T, EdgeHandle)   \
-    RXMESH_ATTR_TM_INST(T, FaceHandle)
+    RXMESH_ATTR_TM_INST(T, FaceHandle)   \
+    RXMESH_ATTR_TM_INST(T, TetHandle)
 
 RXMESH_ATTR_TM_INST_ALL(float)
 RXMESH_ATTR_TM_INST_ALL(double)
@@ -746,7 +736,8 @@ RXMESH_ATTR_TM_INST_ALL(char)
 #define RXMESH_ATTR_GLM_EIGEN_INST_ALL(T)         \
     RXMESH_ATTR_GLM_EIGEN_INST_N(T, VertexHandle) \
     RXMESH_ATTR_GLM_EIGEN_INST_N(T, EdgeHandle)   \
-    RXMESH_ATTR_GLM_EIGEN_INST_N(T, FaceHandle)
+    RXMESH_ATTR_GLM_EIGEN_INST_N(T, FaceHandle)   \
+    RXMESH_ATTR_GLM_EIGEN_INST_N(T, TetHandle)
 
 RXMESH_ATTR_GLM_EIGEN_INST_ALL(char)
 RXMESH_ATTR_GLM_EIGEN_INST_ALL(int8_t)

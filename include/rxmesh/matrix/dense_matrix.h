@@ -20,12 +20,10 @@
 
 namespace rxmesh {
 /**
- * @brief dense matrix use for device and host, inside is a array.
- * The dense matrix is initialized as col major on device.
- * We would only support col major dense matrix for now since that's what
- * cusparse and cusolver wants. However, there is a limited number of operations
- * defined on row major matrices.
- * Order define the storage order of the matrix.
+ * @brief Dense matrix used on the device and host. Column-major is the default
+ * because RXMesh's direct solvers commonly process columns as independent
+ * right-hand sides. Row-major is supported for interleaved per-element values
+ * such as autodiff degrees of freedom. 
  */
 template <typename T, int Order = Eigen::ColMajor>
 struct DenseMatrix
@@ -71,6 +69,7 @@ struct DenseMatrix
                          IndexT        num_cols,
                          locationT     location)
         : m_context(rx.get_context()),
+          m_allocated(LOCATION_NONE),
           m_num_rows(num_rows),
           m_num_cols(num_cols),
           m_dendescr(NULL),
@@ -93,7 +92,8 @@ struct DenseMatrix
      * means that you can not access the matrix using handles
      */
     explicit DenseMatrix(IndexT num_rows, IndexT num_cols, locationT location)
-        : m_num_rows(num_rows),
+        : m_allocated(LOCATION_NONE),
+          m_num_rows(num_rows),
           m_num_cols(num_cols),
           m_dendescr(NULL),
           m_h_val(nullptr),
@@ -123,18 +123,44 @@ struct DenseMatrix
     {
         m_user_managed = true;
 
-        m_allocated = m_allocated | DEVICE;
-        m_allocated = m_allocated | HOST;
-
-
         m_num_rows = num_rows;
         m_num_cols = num_cols;
 
         m_h_val = h_ptr;
         m_d_val = d_ptr;
 
+        if (m_d_val != nullptr) {
+            m_allocated = m_allocated | DEVICE;
+        }
+        if (m_h_val != nullptr) {
+            m_allocated = m_allocated | HOST;
+        }
+
         init_cublas();
         init_cudss();
+    }
+
+    /**
+     * @brief Construct a dense matrix view over caller's device
+     * storage/pointer. Unlike the general user-managed constructor above, this
+     * view stores RXMesh context for handle-based indexing and creates no
+     * CUDA library handles or descriptors. The caller owns device_ptr.
+     */
+    static DenseMatrix device_view(const RXMesh& rx,
+                                   IndexT        num_rows,
+                                   IndexT        num_cols,
+                                   T*            device_ptr)
+    {
+        DenseMatrix ret;
+        ret.m_context      = rx.get_context();
+        ret.m_num_rows     = num_rows;
+        ret.m_num_cols     = num_cols;
+        ret.m_d_val        = device_ptr;
+        ret.m_user_managed = true;
+        if (device_ptr != nullptr) {
+            ret.m_allocated = ret.m_allocated | DEVICE;
+        }
+        return ret;
     }
 
     /**
@@ -166,11 +192,55 @@ struct DenseMatrix
     }
 
     /**
+     * @brief Flags describing which data pointers are available.
+     */
+    __host__ __device__ locationT get_allocated() const
+    {
+        return m_allocated;
+    }
+
+    /**
+     * @brief Whether this wrapper currently owns any CUDA library resource.
+     */
+    __host__ bool has_library_resources() const
+    {
+        bool ret = m_dendescr != nullptr || m_cublas_handle != nullptr;
+#ifdef USE_CUDSS
+        ret = ret || m_cudss_matrix != nullptr;
+#endif
+        return ret;
+    }
+
+    /**
+     * @brief Whether handle indexing uses the supplied mesh context.
+     */
+    template <typename HandleT>
+    __host__ bool has_compatible_context(const RXMesh& rx) const
+    {
+        const Context& other = rx.get_context();
+        if constexpr (std::is_same_v<HandleT, VertexHandle>) {
+            return m_context.vertex_prefix() == other.vertex_prefix();
+        } else if constexpr (std::is_same_v<HandleT, EdgeHandle>) {
+            return m_context.edge_prefix() == other.edge_prefix();
+        } else if constexpr (std::is_same_v<HandleT, FaceHandle>) {
+            return m_context.face_prefix() == other.face_prefix();
+        } else if constexpr (std::is_same_v<HandleT, TetHandle>) {
+            return m_context.tet_prefix() == other.tet_prefix();
+        } else {
+            return false;
+        }
+    }
+
+    /**
      * @brief set all entries in the matrix to certain value on both host and
      * device
      */
     __host__ void reset(T val, locationT location, cudaStream_t stream = NULL)
     {
+
+        if (rows() == 0 || cols() == 0) {
+            return;
+        }
 
         bool do_device = (location & DEVICE) == DEVICE;
         bool do_host   = (location & HOST) == HOST;
@@ -360,13 +430,22 @@ struct DenseMatrix
         if (std::is_floating_point_v<T> || std::is_same_v<T, int> ||
             std::is_same_v<T, cuComplex> ||
             std::is_same_v<T, cuDoubleComplex>) {
-            CUSPARSE_ERROR(cusparseCreateDnMat(&m_dendescr,
-                                               m_num_rows,
-                                               m_num_cols,
-                                               m_num_rows,  // leading dim
-                                               m_d_val,
-                                               cuda_type<T>(),
-                                               CUSPARSE_ORDER_COL));
+            if (m_dendescr) {
+                CUSPARSE_ERROR(cusparseDestroyDnMat(m_dendescr));
+                m_dendescr = nullptr;
+            }
+            if (m_d_val != nullptr) {
+                constexpr cusparseOrder_t StorageOrder =
+                    Order == Eigen::ColMajor ? CUSPARSE_ORDER_COL :
+                                               CUSPARSE_ORDER_ROW;
+                CUSPARSE_ERROR(cusparseCreateDnMat(&m_dendescr,
+                                                   m_num_rows,
+                                                   m_num_cols,
+                                                   lead_dim(),
+                                                   m_d_val,
+                                                   cuda_type<T>(),
+                                                   StorageOrder));
+            }
         }
         init_cudss();
 #endif
@@ -665,7 +744,7 @@ struct DenseMatrix
         T ret = 0;
 
         CUDA_ERROR(cudaMemcpyAsync(
-            &ret, m_d_val + index, sizeof(T), cudaMemcpyDeviceToHost));
+            &ret, m_d_val + index, sizeof(T), cudaMemcpyDeviceToHost, stream));
 
         return std::abs(ret);
     }
@@ -694,10 +773,12 @@ struct DenseMatrix
                 m_cublas_handle, rows() * cols(), m_d_val, 1, &index));
         }
 
+        index -= 1;
+
         T ret = 0;
 
         CUDA_ERROR(cudaMemcpyAsync(
-            &ret, m_d_val + index, sizeof(T), cudaMemcpyDeviceToHost));
+            &ret, m_d_val + index, sizeof(T), cudaMemcpyDeviceToHost, stream));
 
         return std::abs(ret);
     }
@@ -828,6 +909,11 @@ struct DenseMatrix
         if constexpr (std::is_same_v<HandleT, FaceHandle>) {
             assert(m_context.face_prefix() != nullptr);
             row = m_context.face_prefix()[id.first] + id.second;
+        }
+
+        if constexpr (std::is_same_v<HandleT, TetHandle>) {
+            assert(m_context.tet_prefix() != nullptr);
+            row = m_context.tet_prefix()[id.first] + id.second;
         }
 
         return row;
@@ -999,6 +1085,10 @@ struct DenseMatrix
                 "DenseMatrix::move() allocating target before moving to {}",
                 location_to_string(target));
             allocate(target);
+            if ((target & DEVICE) == DEVICE && m_d_val != nullptr) {
+                init_cublas();
+                init_cudss();
+            }
         }
 
         if (source == HOST && target == DEVICE) {
@@ -1056,6 +1146,10 @@ struct DenseMatrix
                 "{}",
                 location_to_string(target_flag));
             allocate(target_flag);
+            if ((target_flag & DEVICE) == DEVICE && m_d_val != nullptr) {
+                init_cublas();
+                init_cudss();
+            }
         }
         // 1) copy from HOST to HOST
         if ((source_flag & HOST) == HOST && (target_flag & HOST) == HOST) {
@@ -1147,36 +1241,43 @@ struct DenseMatrix
      */
     __host__ void release(locationT location = LOCATION_ALL)
     {
-        if (!m_user_managed) {
-
-            if (((location & HOST) == HOST) && ((m_allocated & HOST) == HOST) &&
-                m_h_val) {
+        if (((location & HOST) == HOST) && ((m_allocated & HOST) == HOST)) {
+            if (!m_user_managed && m_h_val) {
                 free(m_h_val);
-                m_h_val     = nullptr;
-                m_allocated = m_allocated & (~HOST);
             }
+            m_h_val     = nullptr;
+            m_allocated = m_allocated & (~HOST);
+        }
 
-            if (((location & DEVICE) == DEVICE) &&
-                ((m_allocated & DEVICE) == DEVICE) && m_d_val) {
-                GPU_FREE(m_d_val);
-                m_d_val     = nullptr;
-                m_allocated = m_allocated & (~DEVICE);
-            }
-
+        if (((location & DEVICE) == DEVICE) &&
+            ((m_allocated & DEVICE) == DEVICE)) {
 #ifdef USE_CUDSS
-            if ((std::is_floating_point_v<T> || std::is_same_v<T, cuComplex> ||
-                 std::is_same_v<T, cuDoubleComplex>) &&
-                m_cudss_matrix) {
+            if (m_cudss_matrix) {
                 CUDSS_ERROR(cudssMatrixDestroy(m_cudss_matrix));
                 m_cudss_matrix = nullptr;
             }
 #endif
-        }
-
-        if ((location & LOCATION_ALL) == LOCATION_ALL && m_dendescr) {
             if (m_dendescr) {
                 CUSPARSE_ERROR(cusparseDestroyDnMat(m_dendescr));
                 m_dendescr = nullptr;
+            }
+            if (!m_user_managed && m_d_val) {
+                GPU_FREE(m_d_val);
+            }
+            m_d_val     = nullptr;
+            m_allocated = m_allocated & (~DEVICE);
+        }
+
+        // Library handles/descriptors belong to this host wrapper even when
+        // its data pointer is user managed.
+        if ((location & LOCATION_ALL) == LOCATION_ALL) {
+            if (m_dendescr) {
+                CUSPARSE_ERROR(cusparseDestroyDnMat(m_dendescr));
+                m_dendescr = nullptr;
+            }
+            if (m_cublas_handle) {
+                CUBLAS_ERROR(cublasDestroy(m_cublas_handle));
+                m_cublas_handle = nullptr;
             }
         }
     }
@@ -1187,6 +1288,10 @@ struct DenseMatrix
      */
     void allocate(locationT location)
     {
+        if (rows() == 0 || cols() == 0) {
+            return;
+        }
+
         if ((location & HOST) == HOST) {
             // release(HOST);
 
@@ -1226,21 +1331,34 @@ struct DenseMatrix
      */
     __host__ void init_cublas()
     {
+        if (m_d_val == nullptr) {
+            return;
+        }
+
         if (std::is_floating_point_v<T> || std::is_same_v<T, int> ||
             std::is_same_v<T, cuComplex> ||
             std::is_same_v<T, cuDoubleComplex>) {
+            if (m_dendescr) {
+                CUSPARSE_ERROR(cusparseDestroyDnMat(m_dendescr));
+                m_dendescr = nullptr;
+            }
+            constexpr cusparseOrder_t StorageOrder = Order == Eigen::ColMajor ?
+                                                         CUSPARSE_ORDER_COL :
+                                                         CUSPARSE_ORDER_ROW;
             CUSPARSE_ERROR(cusparseCreateDnMat(&m_dendescr,
                                                m_num_rows,
                                                m_num_cols,
-                                               m_num_rows,  // leading dim
+                                               lead_dim(),
                                                m_d_val,
                                                cuda_type<T>(),
-                                               CUSPARSE_ORDER_COL));
+                                               StorageOrder));
         }
 
-        CUBLAS_ERROR(cublasCreate(&m_cublas_handle));
-        CUBLAS_ERROR(
-            cublasSetPointerMode(m_cublas_handle, CUBLAS_POINTER_MODE_HOST));
+        if (!m_cublas_handle) {
+            CUBLAS_ERROR(cublasCreate(&m_cublas_handle));
+            CUBLAS_ERROR(cublasSetPointerMode(m_cublas_handle,
+                                              CUBLAS_POINTER_MODE_HOST));
+        }
     }
 
 
@@ -1250,15 +1368,27 @@ struct DenseMatrix
     __host__ void init_cudss()
     {
 #ifdef USE_CUDSS
-        if (std::is_floating_point_v<T> || std::is_same_v<T, cuComplex> ||
-            std::is_same_v<T, cuDoubleComplex>) {
-            CUDSS_ERROR(cudssMatrixCreateDn(&m_cudss_matrix,
-                                            m_num_rows,
-                                            m_num_cols,
-                                            m_num_rows,
-                                            m_d_val,
-                                            cuda_type<T>(),
-                                            CUDSS_LAYOUT_COL_MAJOR));
+        if (m_d_val != nullptr &&
+            (std::is_floating_point_v<T> || std::is_same_v<T, cuComplex> ||
+             std::is_same_v<T, cuDoubleComplex>)) {
+
+            if (m_cudss_matrix) {
+                CUDSS_ERROR(cudssMatrixDestroy(m_cudss_matrix));
+                m_cudss_matrix = nullptr;
+            }
+
+            // cuDSS currently accepts only column-major dense matrices. A
+            // one-column matrix has identical storage in either Eigen order.
+            // this is the flattened representation used by NewtonSolver.
+            if (Order == Eigen::ColMajor || m_num_cols == 1) {
+                CUDSS_ERROR(cudssMatrixCreateDn(&m_cudss_matrix,
+                                                m_num_rows,
+                                                m_num_cols,
+                                                m_num_rows,
+                                                m_d_val,
+                                                cuda_type<T>(),
+                                                CUDSS_LAYOUT_COL_MAJOR));
+            }
         }
 #endif
     }

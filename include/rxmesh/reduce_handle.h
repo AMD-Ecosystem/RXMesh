@@ -9,15 +9,14 @@
 #include "rxmesh/rxmesh.h"
 
 namespace rxmesh {
-namespace detail {
-
-}  // namespace detail
 
 /**
  * @brief This class is used to compute different reduction operations on
  * Attribute. To create a new ReduceHandle, use create_reduce_handle()
  * from Attribute
  * @tparam T The type of the attribute
+ * TODO allows for async dot(), norm2(), arg_max(), arg_min() similar to
+ * reduce_device()
  */
 template <typename T, typename HandleT>
 class ReduceHandle
@@ -133,24 +132,42 @@ class ReduceHandle
      * @param init initial value for reduction. This should be the "neutral"
      * value for the reduction operations e.g., 0 for sum, 1 for multiplication,
      * 0 for max on uint32_t
+     * @param device_output where the output of the reduction will be stored
      * @param attribute_id specific attribute ID to compute its reduction.
      * Default is INVALID32 which compute reduction for all attributes
      * @param stream stream to run the computation on
      * @return the reduced output on the host
      */
     template <typename ReductionOp>
-    T reduce(const Attribute<T, HandleT>& attr,
-             ReductionOp                  reduction_op,
-             T                            init,
-             uint32_t                     attribute_id = INVALID32,
-             cudaStream_t                 stream       = NULL)
+    void reduce_device(const Attribute<T, HandleT>& attr,
+                       ReductionOp                  reduction_op,
+                       T                            init,
+                       T*                           device_output,
+                       uint32_t                     attribute_id = INVALID32,
+                       cudaStream_t                 stream       = NULL)
     {
-        if ((attr.get_allocated() & DEVICE) != DEVICE) {
+        if (device_output == nullptr) {
             RXMESH_ERROR(
-                "ReduceHandle::reduce() input attribute to should be "
-                "allocated on the device");
+                "ReduceHandle::reduce_device() received a null output "
+                "pointer.");
+            return;
         }
 
+        if (m_max_num_patches == 0) {
+            CUDA_ERROR(cudaMemcpyAsync(device_output,
+                                       &init,
+                                       sizeof(T),
+                                       cudaMemcpyHostToDevice,
+                                       stream));
+            return;
+        }
+
+        if ((attr.get_allocated() & DEVICE) != DEVICE) {
+            RXMESH_ERROR(
+                "ReduceHandle::reduce_device() input attribute must be "
+                "allocated on the device.");
+            return;
+        }
 
         detail::generic_reduce<T, Attribute<T, HandleT>::m_block_size>
             <<<m_max_num_patches, attr.m_block_size, 0, stream>>>(
@@ -162,7 +179,48 @@ class ReduceHandle
                 init,
                 attribute_id);
 
-        return reduce_2nd_stage<T>(stream, reduction_op, init);
+        cub::DeviceReduce::Reduce(m_d_reduce_temp_storage,
+                                  m_reduce_temp_storage_bytes,
+                                  m_d_reduce_1st_stage,
+                                  device_output,
+                                  m_max_num_patches,
+                                  reduction_op,
+                                  init,
+                                  stream);
+    }
+
+    /**
+     * @brief Same as reduce_device but the results are returned on the host
+     * as a scalar value
+     */
+    template <typename ReductionOp>
+    T reduce(const Attribute<T, HandleT>& attr,
+             ReductionOp                  reduction_op,
+             T                            init,
+             uint32_t                     attribute_id = INVALID32,
+             cudaStream_t                 stream       = NULL)
+    {
+        T host_output = init;
+        if (m_max_num_patches != 0 &&
+            (attr.get_allocated() & DEVICE) != DEVICE) {
+            RXMESH_ERROR(
+                "ReduceHandle::reduce() input attribute must be allocated on "
+                "the device.");
+            return host_output;
+        }
+        reduce_device(attr,
+                      reduction_op,
+                      init,
+                      m_d_reduce_2nd_stage,
+                      attribute_id,
+                      stream);
+        CUDA_ERROR(cudaMemcpyAsync(&host_output,
+                                   m_d_reduce_2nd_stage,
+                                   sizeof(T),
+                                   cudaMemcpyDeviceToHost,
+                                   stream));
+        CUDA_ERROR(cudaStreamSynchronize(stream));
+        return host_output;
     }
 
    private:
@@ -206,5 +264,8 @@ using EdgeReduceHandle = ReduceHandle<T, EdgeHandle>;
 
 template <class T>
 using FaceReduceHandle = ReduceHandle<T, FaceHandle>;
+
+template <class T>
+using TetReduceHandle = ReduceHandle<T, TetHandle>;
 
 }  // namespace rxmesh

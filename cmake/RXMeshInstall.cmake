@@ -31,13 +31,16 @@ function(rxmesh_install_target_if_exists target_name)
     if(TARGET "${target_name}")
         install(TARGETS "${target_name}"
                 ARCHIVE DESTINATION "${RXMESH_INSTALL_LIBDIR}"
+                ${_RXMESH_INSTALL_COMPONENT_ARGS}
                 LIBRARY DESTINATION "${RXMESH_INSTALL_LIBDIR}"
+                ${_RXMESH_INSTALL_COMPONENT_ARGS}
                 RUNTIME DESTINATION "${RXMESH_INSTALL_BINDIR}"
                 ${_RXMESH_INSTALL_COMPONENT_ARGS})
     endif()
 endfunction()
 
 rxmesh_install_target_if_exists(RXMesh)
+rxmesh_install_target_if_exists(mshio)
 rxmesh_install_target_if_exists(GKlib)
 rxmesh_install_target_if_exists(metis)
 rxmesh_install_target_if_exists(polyscope)
@@ -119,6 +122,7 @@ write_basic_package_version_file(
 install(FILES
         "${CMAKE_CURRENT_BINARY_DIR}/RXMeshConfig.cmake"
         "${CMAKE_CURRENT_BINARY_DIR}/RXMeshConfigVersion.cmake"
+        "${RXMESH_SOURCE_DIR}/cmake/RXMeshApp.cmake"
         DESTINATION "${RXMESH_INSTALL_CMAKEDIR}"
         ${_RXMESH_INSTALL_COMPONENT_ARGS})
 

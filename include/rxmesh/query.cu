@@ -80,6 +80,36 @@ template struct Query<1024>;
         cooperative_groups::thread_block&,                       \
         ShmemAllocator&,                                         \
         const bool,                                              \
+        const bool);                                             \
+    template __device__ void Query<BLOCK_THREADS>::prologue<Op::VT>(        \
+        cooperative_groups::thread_block&,                       \
+        ShmemAllocator&,                                         \
+        const bool,                                              \
+        const bool);                                             \
+    template __device__ void Query<BLOCK_THREADS>::prologue<Op::ET>(        \
+        cooperative_groups::thread_block&,                       \
+        ShmemAllocator&,                                         \
+        const bool,                                              \
+        const bool);                                             \
+    template __device__ void Query<BLOCK_THREADS>::prologue<Op::FT>(        \
+        cooperative_groups::thread_block&,                       \
+        ShmemAllocator&,                                         \
+        const bool,                                              \
+        const bool);                                             \
+    template __device__ void Query<BLOCK_THREADS>::prologue<Op::TV>(        \
+        cooperative_groups::thread_block&,                       \
+        ShmemAllocator&,                                         \
+        const bool,                                              \
+        const bool);                                             \
+    template __device__ void Query<BLOCK_THREADS>::prologue<Op::TE>(        \
+        cooperative_groups::thread_block&,                       \
+        ShmemAllocator&,                                         \
+        const bool,                                              \
+        const bool);                                             \
+    template __device__ void Query<BLOCK_THREADS>::prologue<Op::TF>(        \
+        cooperative_groups::thread_block&,                       \
+        ShmemAllocator&,                                         \
+        const bool,                                              \
         const bool);
 
 RXMESH_QUERY_INSTANTIATE_PROLOGUE(128)
@@ -99,7 +129,9 @@ RXMESH_QUERY_INSTANTIATE_PROLOGUE(1024)
     template __device__ DEdgeIterator                                         \
     Query<BLOCK_THREADS>::get_iterator<DEdgeIterator>(uint16_t) const;        \
     template __device__ FaceIterator                                          \
-    Query<BLOCK_THREADS>::get_iterator<FaceIterator>(uint16_t) const;
+    Query<BLOCK_THREADS>::get_iterator<FaceIterator>(uint16_t) const;         \
+    template __device__ TetIterator                                           \
+    Query<BLOCK_THREADS>::get_iterator<TetIterator>(uint16_t) const;
 
 RXMESH_QUERY_INSTANTIATE_GET_ITERATOR(128)
 RXMESH_QUERY_INSTANTIATE_GET_ITERATOR(256)
