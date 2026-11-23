@@ -362,7 +362,7 @@ class Attribute : public AttributeBase
 
             CUDA_ERROR(cudaPointerGetAttributes(&external_attributes, ptr));
 
-#if CUDART_VERSION >= 10000
+#if CUDART_VERSION >= 10000 || defined(__HIP_PLATFORM_AMD__)
             if (external_attributes.type != cudaMemoryTypeDevice) {
 #else
             if (external_attributes.memoryType != cudaMemoryTypeDevice) {

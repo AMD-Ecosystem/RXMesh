@@ -64,7 +64,7 @@ __global__ void identify_tet_boundary_vertices(const Context      context,
         }
     };
 
-    query.dispatch<Op::FT>(block, shrd_alloc, boundary_faces);
+    query.template dispatch<Op::FT>(block, shrd_alloc, boundary_faces);
 
     block.sync();
 
@@ -76,7 +76,7 @@ __global__ void identify_tet_boundary_vertices(const Context      context,
         }
     };
 
-    query.dispatch<Op::FV>(block, shrd_alloc, boundary_vertices);
+    query.template dispatch<Op::FV>(block, shrd_alloc, boundary_vertices);
 }
 }  // namespace detail
 

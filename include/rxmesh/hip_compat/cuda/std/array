@@ -1,0 +1,11 @@
+#pragma once
+// HIP-only redirect: <cuda/std/array> -> std::array. clang compiles constexpr
+// functions for both host and device under HIP, so std::array is usable in
+// __host__ __device__ constexpr code without libcu++.
+#include <array>
+
+namespace cuda {
+namespace std {
+using ::std::array;
+}  // namespace std
+}  // namespace cuda

@@ -35,6 +35,7 @@
 #define cudaDataType                       hipDataType
 #define cudaDataType_t                     hipDataType
 #define cudaMemcpyKind                     hipMemcpyKind
+#define cudaPointerAttributes              hipPointerAttribute_t
 
 // ---- runtime: enums ----
 #define cudaMemcpyHostToDevice             hipMemcpyHostToDevice
@@ -45,6 +46,7 @@
 #define cudaFuncAttributeMaxDynamicSharedMemorySize \
     hipFuncAttributeMaxDynamicSharedMemorySize
 #define cudaFuncCachePreferShared          hipFuncCachePreferShared
+#define cudaMemoryTypeDevice               hipMemoryTypeDevice
 
 // data-type enums used by the dense/sparse matrix generic API + cuda_type()
 #define CUDA_R_32F                         HIP_R_32F
@@ -69,6 +71,7 @@
 #define cudaMemset                         hipMemset
 #define cudaMemsetAsync                    hipMemsetAsync
 #define cudaMemGetInfo                     hipMemGetInfo
+#define cudaPointerGetAttributes           hipPointerGetAttributes
 #define cudaDeviceSynchronize              hipDeviceSynchronize
 #define cudaDeviceReset                    hipDeviceReset
 #define cudaStreamSynchronize              hipStreamSynchronize
