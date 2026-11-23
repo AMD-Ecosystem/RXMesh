@@ -1,11 +1,47 @@
 #pragma once
-// HIP-only redirect: <cuda/std/array> -> std::array. clang compiles constexpr
-// functions for both host and device under HIP, so std::array is usable in
-// __host__ __device__ constexpr code without libcu++.
-#include <array>
+// HIP-only redirect for <cuda/std/array>: a minimal aggregate with
+// __host__ __device__ accessors, so device code does not depend on the host
+// standard library's std::array (whose debug checks call host-only functions).
+#include <hip/hip_runtime.h>
+#include <cstddef>
 
 namespace cuda {
 namespace std {
-using ::std::array;
+
+template <class T, ::std::size_t N>
+struct array
+{
+    T m_elems[N];
+
+    __host__ __device__ constexpr T& operator[](::std::size_t i)
+    {
+        return m_elems[i];
+    }
+    __host__ __device__ constexpr const T& operator[](::std::size_t i) const
+    {
+        return m_elems[i];
+    }
+    __host__ __device__ constexpr ::std::size_t size() const
+    {
+        return N;
+    }
+    __host__ __device__ constexpr T* begin()
+    {
+        return m_elems;
+    }
+    __host__ __device__ constexpr T* end()
+    {
+        return m_elems + N;
+    }
+    __host__ __device__ constexpr const T* begin() const
+    {
+        return m_elems;
+    }
+    __host__ __device__ constexpr const T* end() const
+    {
+        return m_elems + N;
+    }
+};
+
 }  // namespace std
 }  // namespace cuda
